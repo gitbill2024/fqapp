@@ -221,23 +221,28 @@ async fn handler(State(state): State<AppState>, req: axum::extract::Request) -> 
             )
         })
         .collect();
-    // The dispatcher and every current endpoint ignore request bodies. Drain
-    // them in bounded frames to preserve the size limit without retaining a
-    // whole payload or copying it into Request::body.
-    if let Err(status) = discard_request_body(req.into_body()).await {
-        let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
-            "request body too large"
-        } else {
-            "failed to read request body"
-        };
-        return refuse(status, message);
-    }
+    // Read the request body (bounded by MAX_REQUEST_BODY) so POST handlers that
+    // parse payloads — the account library / history capture endpoints and any
+    // future body-reading route — receive their bytes. Previously the body was
+    // always drained and Request::body stayed empty, so those endpoints always
+    // failed with a parse error over HTTP.
+    let body = match collect_request_body(req.into_body()).await {
+        Ok(b) => b,
+        Err(status) => {
+            let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                "request body too large"
+            } else {
+                "failed to read request body"
+            };
+            return refuse(status, message);
+        }
+    };
     let server = state.server;
     let request = Request {
         method,
         path: request_path,
         query: uri.query().unwrap_or("").to_string(),
-        body: Vec::new(),
+        body,
         headers,
     };
     let resp = dispatch(&server, &request).await;
@@ -292,6 +297,7 @@ async fn handler(State(state): State<AppState>, req: axum::extract::Request) -> 
     }
 }
 
+#[allow(dead_code)] // still exercised by the body-drain test below
 async fn discard_request_body(mut body: Body) -> Result<(), StatusCode> {
     use http_body_util::BodyExt;
 
@@ -306,6 +312,25 @@ async fn discard_request_body(mut body: Body) -> Result<(), StatusCode> {
         }
     }
     Ok(())
+}
+
+/// Read a request body into memory, bounded by [`MAX_REQUEST_BODY`], so that
+/// endpoints which parse a JSON payload (e.g. the account library / history
+/// capture POST routes) receive their bytes over HTTP.
+async fn collect_request_body(mut body: Body) -> Result<Vec<u8>, StatusCode> {
+    use http_body_util::BodyExt;
+
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| StatusCode::BAD_REQUEST)?;
+        if let Ok(data) = frame.into_data() {
+            if out.len().saturating_add(data.len()) > MAX_REQUEST_BODY {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+            out.extend_from_slice(&data);
+        }
+    }
+    Ok(out)
 }
 
 async fn stream_file(path: &std::path::Path, offset: u64, length: u64) -> Result<Body, String> {
